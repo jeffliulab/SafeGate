@@ -1,0 +1,30 @@
+提交作业的方法：
+
+
+打包文件：
+tar -czvf a3.tar.gz server.c
+
+解压缩：
+tar -xzvf a3.tar.gz
+
+
+连接到学校服务器：
+ssh -J pliu07@homework.cs.tufts.edu pliu07@comp112-08.cs.tufts.edu
+
+然后上传文件：
+scp -J pliu07@homework.cs.tufts.edu a3.tar.gz pliu07@comp112-08.cs.tufts.edu:~
+scp -J pliu07@homework.cs.tufts.edu server.c pliu07@comp112-08.cs.tufts.edu:~
+
+然后提交作业：
+provide comp112 a0 a0.tar.gz
+
+检查提交/作业分数：
+progress comp112 a1
+
+
+
+---
+
+拉文件：
+scp pliu07@homework.cs.tufts.edu:~/file .
+
