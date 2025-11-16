@@ -1,0 +1,23 @@
+================================================
+请不要修改本文件
+================================================
+
+
+
+================================================
+启动步骤
+================================================
+
+【终端1 - Flask】
+cd /home/jeffliu/homework/Final_Project/Prototype/Part2
+source venv/bin/activate
+python3 llm_server.py
+
+【终端2 - Proxy】
+cd /home/jeffliu/homework/Final_Project/Prototype/Part2
+./proxy 8080 proxyCertificates/proxy_ca.crt proxyCertificates/proxy_ca.key
+
+【浏览器】
+配置代理：127.0.0.1:8080
+打开F12 → Console标签（重要！）
+访问：https://zh.wikipedia.org/wiki/奥地利
