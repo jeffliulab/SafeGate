@@ -1,675 +1,754 @@
-// CS112 Final Project Part1 - HTTPS Proxy
-// Based on a2 code with proxy features added (eg. openssl)
+/* CS112 Final Project Part 1 - HTTPS Proxy
+ * Supports HTTP and HTTPS with TLS interception (MITM)
+ * Features: Multi-threading, certificate generation, header injection
+ */
 
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <arpa/inet.h>
 #include <sys/socket.h>
-#include <sys/select.h>
-#include <time.h>
-#include <errno.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 #include <netdb.h>
+#include <pthread.h>
 #include <signal.h>
-
-// OpenSSL headers for HTTPS
+#include <errno.h>
+#include <sys/select.h>
+#include <fcntl.h>
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 #include <openssl/x509.h>
+#include <openssl/x509v3.h>
 #include <openssl/pem.h>
 #include <openssl/rsa.h>
 #include <openssl/evp.h>
 
-#define MAX_CLIENTS 200
-#define BUFFER_SIZE 16384
+#define BUFFER_SIZE 65536
+#define MAX_HEADER_SIZE 8192
+#define BACKLOG 128
 
-// Global CA cert and key - loaded from command line args
-X509 *g_ca_cert = NULL;
-EVP_PKEY *g_ca_key = NULL;
+/* Global CA certificate and key for signing */
+static X509 *ca_cert = NULL;
+static EVP_PKEY *ca_key = NULL;
 
-// Connection info - modified from a2
+/* Client connection context */
 typedef struct {
     int client_fd;
-    int server_fd;
-    SSL *client_ssl;        // for HTTPS connections
-    SSL *server_ssl;
-    SSL_CTX *client_ctx;
-    SSL_CTX *server_ctx;
-    int is_https;
-    char hostname[256];     // need this for cert generation
-    int port;
-    char client_buffer[BUFFER_SIZE];
-    int client_buffer_len;
-    int slot;
-    time_t last_activity_time;
-} connection_info;
+    struct sockaddr_in client_addr;
+} client_context_t;
 
-connection_info connections[MAX_CLIENTS];
-int proxy_listen_fd;
-fd_set master_fds;
-
-// Function declarations
-void init_connection(int index);
-void close_connection(int index);
+/* Function prototypes */
+void *handle_client(void *arg);
+void handle_http_request(int client_fd, char *request, size_t req_len);
+void handle_https_connect(int client_fd, char *request, size_t req_len);
 int connect_to_server(const char *hostname, int port);
-int parse_http_request(const char *buffer, char *method, char *host, int *port, char *path);
-int handle_http_request(int conn_index);
-int handle_connect_request(int conn_index, const char *hostname, int port);
-X509 *generate_fake_certificate(const char *hostname, EVP_PKEY *pkey);
-int setup_client_ssl(int conn_index);
-int setup_server_ssl(int conn_index);
-void inject_proxy_header(char *response, int *response_len);
-void handle_data_transfer(int conn_index, int from_client);
+X509 *generate_cert(const char *hostname);
+SSL_CTX *create_ssl_context_server(void);
+SSL_CTX *create_ssl_context_client(void);
+void inject_header(char *response, size_t *response_len, size_t buffer_size);
+int read_line(int fd, char *buf, size_t max_len);
+void parse_host_port(char *host_header, char **hostname, int *port);
+int load_ca_cert_and_key(const char *cert_path, const char *key_path);
 
-// Init openssl - needed before any SSL operations
-void init_openssl() {
-    SSL_library_init();
-    SSL_load_error_strings();
-    OpenSSL_add_all_algorithms();
-}
-
-// Load CA certificate and private key from files
-// We use these to sign fake certs later
-int load_ca_credentials(const char *cert_path, const char *key_path) {
-    FILE *fp = fopen(cert_path, "r");
-    if (!fp) {
-        perror("Failed to open CA certificate");
-        return -1;
-    }
-    g_ca_cert = PEM_read_X509(fp, NULL, NULL, NULL);
-    fclose(fp);
-    
-    if (!g_ca_cert) {
-        fprintf(stderr, "Failed to read CA certificate\n");
-        return -1;
-    }
-    
-    fp = fopen(key_path, "r");
-    if (!fp) {
-        perror("Failed to open CA private key");
-        return -1;
-    }
-    g_ca_key = PEM_read_PrivateKey(fp, NULL, NULL, NULL);
-    fclose(fp);
-    
-    if (!g_ca_key) {
-        fprintf(stderr, "Failed to read CA private key\n");
-        return -1;
-    }
-    
-    printf("CA credentials loaded successfully\n");
-    return 0;
-}
-
-// Generate fake cert for the target hostname
-// This gets signed by our CA so the browser trusts it
-X509 *generate_fake_certificate(const char *hostname, EVP_PKEY *pkey) {
-    X509 *cert = X509_new();
-    if (!cert) return NULL;
-    
-    X509_set_version(cert, 2);  // v3
-    ASN1_INTEGER_set(X509_get_serialNumber(cert), (long)time(NULL));
-    
-    // Valid for 1 year
-    X509_gmtime_adj(X509_get_notBefore(cert), 0);
-    X509_gmtime_adj(X509_get_notAfter(cert), 31536000L);
-    
-    X509_set_pubkey(cert, pkey);
-    
-    // Set CN to the hostname (important - must match!)
-    X509_NAME *name = X509_NAME_new();
-    X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC, 
-                               (unsigned char *)hostname, -1, -1, 0);
-    X509_set_subject_name(cert, name);
-    
-    // Issuer is our CA
-    X509_set_issuer_name(cert, X509_get_subject_name(g_ca_cert));
-    
-    // Sign with CA private key - this is the key part
-    X509_sign(cert, g_ca_key, EVP_sha256());
-    
-    return cert;
-}
-
-// Connect to the upstream server
-int connect_to_server(const char *hostname, int port) {
-    struct sockaddr_in server_addr;
-    struct hostent *server;
-    int sockfd;
-    
-    sockfd = socket(AF_INET, SOCK_STREAM, 0);
-    if (sockfd < 0) {
-        perror("Failed to create socket for upstream server");
-        return -1;
-    }
-    
-    server = gethostbyname(hostname);
-    if (server == NULL) {
-        fprintf(stderr, "Failed to resolve hostname: %s\n", hostname);
-        close(sockfd);
-        return -1;
-    }
-    
-    memset(&server_addr, 0, sizeof(server_addr));
-    server_addr.sin_family = AF_INET;
-    memcpy(&server_addr.sin_addr.s_addr, server->h_addr, server->h_length);
-    server_addr.sin_port = htons(port);
-    
-    if (connect(sockfd, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
-        perror("Failed to connect to upstream server");
-        close(sockfd);
-        return -1;
-    }
-    
-    return sockfd;
-}
-
-// Parse HTTP request - extract method, host, port, path
-int parse_http_request(const char *buffer, char *method, char *host, int *port, char *path) {
-    char temp_url[512];
-    
-    // Get method and URL from first line
-    if (sscanf(buffer, "%s %s", method, temp_url) != 2) {
-        return -1;
-    }
-    
-    *port = 80;
-    strcpy(path, "/");
-    
-    // CONNECT requests have different format
-    if (strcmp(method, "CONNECT") == 0) {
-        if (sscanf(temp_url, "%[^:]:%d", host, port) < 1) {
-            return -1;
-        }
-        return 0;
-    }
-    
-    // For GET/POST etc, extract host from Host header
-    char *host_line = strstr(buffer, "Host: ");
-    if (!host_line) {
-        return -1;
-    }
-    
-    host_line += 6;
-    if (sscanf(host_line, "%[^:\r\n]:%d", host, port) < 1) {
-        sscanf(host_line, "%[^\r\n]", host);
-    }
-    
-    // Extract path from URL
-    if (strstr(temp_url, "http://") == temp_url) {
-        char *path_start = strchr(temp_url + 7, '/');
-        if (path_start) {
-            strcpy(path, path_start);
-        }
-    } else {
-        strcpy(path, temp_url);
-    }
-    
-    return 0;
-}
-
-// Handle regular HTTP requests (GET, POST, etc)
-int handle_http_request(int conn_index) {
-    char method[16], host[256], path[512];
-    int port;
-    
-    if (parse_http_request(connections[conn_index].client_buffer, method, host, &port, path) < 0) {
-        fprintf(stderr, "Failed to parse HTTP request\n");
-        return -1;
-    }
-    
-    printf("HTTP %s request to %s:%d%s\n", method, host, port, path);
-    
-    // Connect to the actual server
-    connections[conn_index].server_fd = connect_to_server(host, port);
-    if (connections[conn_index].server_fd < 0) {
-        return -1;
-    }
-    
-    // Rebuild request and forward it
-    char request[BUFFER_SIZE];
-    snprintf(request, sizeof(request), "%s %s HTTP/1.1\r\n", method, path);
-    
-    char *headers = strstr(connections[conn_index].client_buffer, "\r\n");
-    if (headers) {
-        headers += 2;
-        strncat(request, headers, sizeof(request) - strlen(request) - 1);
-    }
-    
-    if (write(connections[conn_index].server_fd, request, strlen(request)) < 0) {
-        perror("Failed to send request to upstream server");
-        return -1;
-    }
-    
-    FD_SET(connections[conn_index].server_fd, &master_fds);
-    
-    return 0;
-}
-
-// Handle CONNECT requests for HTTPS
-int handle_connect_request(int conn_index, const char *hostname, int port) {
-    printf("CONNECT request to %s:%d\n", hostname, port);
-    
-    // Save hostname - we need it for generating the fake cert
-    strncpy(connections[conn_index].hostname, hostname, sizeof(connections[conn_index].hostname) - 1);
-    connections[conn_index].hostname[sizeof(connections[conn_index].hostname) - 1] = '\0';
-    connections[conn_index].port = port;
-    connections[conn_index].is_https = 1;
-    
-    // Connect to real server
-    connections[conn_index].server_fd = connect_to_server(hostname, port);
-    if (connections[conn_index].server_fd < 0) {
-        return -1;
-    }
-    
-    // Send 200 to client
-    const char *response = "HTTP/1.1 200 Connection Established\r\n\r\n";
-    if (write(connections[conn_index].client_fd, response, strlen(response)) < 0) {
-        perror("Failed to send CONNECT response");
-        return -1;
-    }
-    
-    // Now setup SSL on both sides - this is the MITM part
-    if (setup_client_ssl(conn_index) < 0) {
-        fprintf(stderr, "Failed to setup SSL with client\n");
-        return -1;
-    }
-    
-    if (setup_server_ssl(conn_index) < 0) {
-        fprintf(stderr, "Failed to setup SSL with server\n");
-        return -1;
-    }
-    
-    FD_SET(connections[conn_index].server_fd, &master_fds);
-    
-    return 0;
-}
-
-// Setup SSL with client - we pretend to be the server
-// This is where we use the fake cert
-int setup_client_ssl(int conn_index) {
-    SSL_CTX *ctx = SSL_CTX_new(TLS_server_method());
-    if (!ctx) {
-        ERR_print_errors_fp(stderr);
-        return -1;
-    }
-    
-    // Generate RSA key pair for this connection
-    EVP_PKEY *pkey = EVP_PKEY_new();
-    RSA *rsa = RSA_new();
-    BIGNUM *bn = BN_new();
-    BN_set_word(bn, RSA_F4);
-    RSA_generate_key_ex(rsa, 2048, bn, NULL);
-    EVP_PKEY_assign_RSA(pkey, rsa);
-    BN_free(bn);
-    
-    // Generate fake cert with the hostname
-    X509 *cert = generate_fake_certificate(connections[conn_index].hostname, pkey);
-    if (!cert) {
-        fprintf(stderr, "Failed to generate fake certificate\n");
-        EVP_PKEY_free(pkey);
-        SSL_CTX_free(ctx);
-        return -1;
-    }
-    
-    SSL_CTX_use_certificate(ctx, cert);
-    SSL_CTX_use_PrivateKey(ctx, pkey);
-    
-    SSL *ssl = SSL_new(ctx);
-    SSL_set_fd(ssl, connections[conn_index].client_fd);
-    
-    // Do SSL handshake as server
-    if (SSL_accept(ssl) <= 0) {
-        ERR_print_errors_fp(stderr);
-        SSL_free(ssl);
-        SSL_CTX_free(ctx);
-        EVP_PKEY_free(pkey);
-        X509_free(cert);
-        return -1;
-    }
-    
-    connections[conn_index].client_ssl = ssl;
-    connections[conn_index].client_ctx = ctx;
-    
-    printf("SSL established with client for %s\n", connections[conn_index].hostname);
-    return 0;
-}
-
-// Setup SSL with real server - we act as client
-int setup_server_ssl(int conn_index) {
-    SSL_CTX *ctx = SSL_CTX_new(TLS_client_method());
-    if (!ctx) {
-        ERR_print_errors_fp(stderr);
-        return -1;
-    }
-    
-    SSL *ssl = SSL_new(ctx);
-    SSL_set_fd(ssl, connections[conn_index].server_fd);
-    
-    // SSL handshake as client
-    if (SSL_connect(ssl) <= 0) {
-        ERR_print_errors_fp(stderr);
-        SSL_free(ssl);
-        SSL_CTX_free(ctx);
-        return -1;
-    }
-    
-    connections[conn_index].server_ssl = ssl;
-    connections[conn_index].server_ctx = ctx;
-    
-    printf("SSL established with server %s\n", connections[conn_index].hostname);
-    return 0;
-}
-
-// Inject X-Proxy: CS112 header into HTTP response
-void inject_proxy_header(char *response, int *response_len) {
-    char *header_end = strstr(response, "\r\n\r\n");
-    if (!header_end) {
-        return;  // not a valid HTTP response
-    }
-    
-    // Don't inject twice
-    if (strstr(response, "X-Proxy: CS112") != NULL) {
+/* Signal handler for clean shutdown */
+void signal_handler(int sig) {
+    if (sig == SIGPIPE) {
+        /* Ignore SIGPIPE */
         return;
     }
-    
-    int header_len = header_end - response;
-    int body_len = *response_len - header_len - 4;
-    
-    // Make sure we have space
-    if (body_len < 0 || header_len + 21 + body_len > BUFFER_SIZE) {
-        return;
-    }
-    
-    // Shift body data to make room for new header
-    memmove(header_end + 21, header_end + 4, body_len);
-    
-    // Insert X-Proxy header (21 bytes total)
-    memcpy(header_end, "\r\nX-Proxy: CS112\r\n\r\n", 21);
-    
-    *response_len = header_len + 21 + body_len;
-}
-
-// Transfer data between client and server
-void handle_data_transfer(int conn_index, int from_client) {
-    char buffer[BUFFER_SIZE];
-    int bytes_read;
-    
-    if (from_client) {
-        // Read from client
-        if (connections[conn_index].client_ssl) {
-            bytes_read = SSL_read(connections[conn_index].client_ssl, buffer, sizeof(buffer));
-        } else {
-            bytes_read = read(connections[conn_index].client_fd, buffer, sizeof(buffer));
-        }
-        
-        if (bytes_read <= 0) {
-            close_connection(conn_index);
-            return;
-        }
-        
-        // Forward to server
-        int bytes_written;
-        if (connections[conn_index].server_ssl) {
-            bytes_written = SSL_write(connections[conn_index].server_ssl, buffer, bytes_read);
-        } else {
-            bytes_written = write(connections[conn_index].server_fd, buffer, bytes_read);
-        }
-        
-        if (bytes_written <= 0) {
-            close_connection(conn_index);
-            return;
-        }
-    } else {
-        // Read from server
-        if (connections[conn_index].server_ssl) {
-            bytes_read = SSL_read(connections[conn_index].server_ssl, buffer, sizeof(buffer));
-        } else {
-            bytes_read = read(connections[conn_index].server_fd, buffer, sizeof(buffer));
-        }
-        
-        if (bytes_read <= 0) {
-            close_connection(conn_index);
-            return;
-        }
-        
-        // Inject header if this is an HTTP response
-        if (strstr(buffer, "HTTP/") == buffer) {
-            inject_proxy_header(buffer, &bytes_read);
-        }
-        
-        // Forward to client
-        int bytes_written;
-        if (connections[conn_index].client_ssl) {
-            bytes_written = SSL_write(connections[conn_index].client_ssl, buffer, bytes_read);
-        } else {
-            bytes_written = write(connections[conn_index].client_fd, buffer, bytes_read);
-        }
-        
-        if (bytes_written <= 0) {
-            close_connection(conn_index);
-            return;
-        }
-    }
-    
-    connections[conn_index].last_activity_time = time(NULL);
-}
-
-void init_connection(int index) {
-    connections[index].client_fd = -1;
-    connections[index].server_fd = -1;
-    connections[index].client_ssl = NULL;
-    connections[index].server_ssl = NULL;
-    connections[index].client_ctx = NULL;
-    connections[index].server_ctx = NULL;
-    connections[index].is_https = 0;
-    connections[index].hostname[0] = '\0';
-    connections[index].port = 0;
-    connections[index].client_buffer_len = 0;
-    connections[index].slot = 0;
-    connections[index].last_activity_time = 0;
-}
-
-void close_connection(int index) {
-    if (connections[index].slot == 0) return;
-    
-    // Clean up SSL stuff
-    if (connections[index].client_ssl) {
-        SSL_shutdown(connections[index].client_ssl);
-        SSL_free(connections[index].client_ssl);
-        connections[index].client_ssl = NULL;
-    }
-    
-    if (connections[index].server_ssl) {
-        SSL_shutdown(connections[index].server_ssl);
-        SSL_free(connections[index].server_ssl);
-        connections[index].server_ssl = NULL;
-    }
-    
-    if (connections[index].client_ctx) {
-        SSL_CTX_free(connections[index].client_ctx);
-        connections[index].client_ctx = NULL;
-    }
-    
-    if (connections[index].server_ctx) {
-        SSL_CTX_free(connections[index].server_ctx);
-        connections[index].server_ctx = NULL;
-    }
-    
-    // Close sockets
-    if (connections[index].client_fd >= 0) {
-        FD_CLR(connections[index].client_fd, &master_fds);
-        close(connections[index].client_fd);
-    }
-    
-    if (connections[index].server_fd >= 0) {
-        FD_CLR(connections[index].server_fd, &master_fds);
-        close(connections[index].server_fd);
-    }
-    
-    init_connection(index);
-}
-
-void add_new_connection(int client_fd) {
-    for (int i = 0; i < MAX_CLIENTS; i++) {
-        if (connections[i].slot == 0) {
-            connections[i].client_fd = client_fd;
-            connections[i].slot = 1;
-            connections[i].last_activity_time = time(NULL);
-            FD_SET(client_fd, &master_fds);
-            printf("New connection accepted, fd=%d\n", client_fd);
-            return;
-        }
-    }
-    
-    printf("Maximum clients reached, connection rejected\n");
-    close(client_fd);
 }
 
 int main(int argc, char *argv[]) {
-    // Ignore SIGPIPE - prevents crash when client closes connection
-    signal(SIGPIPE, SIG_IGN);
-    
     if (argc != 4) {
         fprintf(stderr, "Usage: %s <port> <ca_cert_path> <ca_key_path>\n", argv[0]);
         exit(EXIT_FAILURE);
     }
-    
+
     int port = atoi(argv[1]);
-    char *ca_cert_path = argv[2];
-    char *ca_key_path = argv[3];
-    
-    printf("Starting proxy on port %d\n", port);
-    printf("Using CA cert: %s\n", ca_cert_path);
-    printf("Using CA key: %s\n", ca_key_path);
-    
-    init_openssl();
-    if (load_ca_credentials(ca_cert_path, ca_key_path) < 0) {
-        fprintf(stderr, "Failed to load CA credentials\n");
+    const char *ca_cert_path = argv[2];
+    const char *ca_key_path = argv[3];
+
+    /* Load CA certificate and key */
+    if (load_ca_cert_and_key(ca_cert_path, ca_key_path) != 0) {
+        fprintf(stderr, "Failed to load CA certificate and key\n");
         exit(EXIT_FAILURE);
     }
-    
-    for (int i = 0; i < MAX_CLIENTS; i++) {
-        init_connection(i);
-    }
-    
-    // Setup listening socket - same as a2
-    struct sockaddr_in server_addr;
-    proxy_listen_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (proxy_listen_fd < 0) {
-        perror("Socket creation failed");
+
+    /* Initialize OpenSSL */
+    SSL_library_init();
+    SSL_load_error_strings();
+    OpenSSL_add_all_algorithms();
+
+    /* Ignore SIGPIPE */
+    signal(SIGPIPE, signal_handler);
+
+    /* Create listening socket */
+    int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (listen_fd < 0) {
+        perror("socket");
         exit(EXIT_FAILURE);
     }
-    
+
+    /* Set socket options */
     int opt = 1;
-    setsockopt(proxy_listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-    
+    if (setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
+        perror("setsockopt");
+        close(listen_fd);
+        exit(EXIT_FAILURE);
+    }
+
+    /* Bind socket */
+    struct sockaddr_in server_addr;
     memset(&server_addr, 0, sizeof(server_addr));
     server_addr.sin_family = AF_INET;
     server_addr.sin_addr.s_addr = INADDR_ANY;
     server_addr.sin_port = htons(port);
-    
-    if (bind(proxy_listen_fd, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
-        perror("Bind failed");
+
+    if (bind(listen_fd, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
+        perror("bind");
+        close(listen_fd);
         exit(EXIT_FAILURE);
     }
-    
-    if (listen(proxy_listen_fd, 10) < 0) {
-        perror("Listen failed");
+
+    /* Listen */
+    if (listen(listen_fd, BACKLOG) < 0) {
+        perror("listen");
+        close(listen_fd);
         exit(EXIT_FAILURE);
     }
-    
-    printf("Proxy listening on port %d\n", port);
-    
-    fd_set read_fds;
-    FD_ZERO(&master_fds);
-    FD_SET(proxy_listen_fd, &master_fds);
-    
-    // Main select loop
+
+    printf("Proxy server listening on port %d\n", port);
+
+    /* Accept connections */
     while (1) {
-        read_fds = master_fds;
+        struct sockaddr_in client_addr;
+        socklen_t client_len = sizeof(client_addr);
+        int client_fd = accept(listen_fd, (struct sockaddr *)&client_addr, &client_len);
+
+        if (client_fd < 0) {
+            perror("accept");
+            continue;
+        }
+
+        /* Create client context */
+        client_context_t *ctx = malloc(sizeof(client_context_t));
+        if (!ctx) {
+            close(client_fd);
+            continue;
+        }
+        ctx->client_fd = client_fd;
+        ctx->client_addr = client_addr;
+
+        /* Handle client in a new thread */
+        pthread_t thread;
+        pthread_attr_t attr;
+        pthread_attr_init(&attr);
+        pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
         
-        int max_fd = proxy_listen_fd;
-        for (int i = 0; i < MAX_CLIENTS; i++) {
-            if (connections[i].client_fd > max_fd) {
-                max_fd = connections[i].client_fd;
-            }
-            if (connections[i].server_fd > max_fd) {
-                max_fd = connections[i].server_fd;
+        if (pthread_create(&thread, &attr, handle_client, ctx) != 0) {
+            perror("pthread_create");
+            close(client_fd);
+            free(ctx);
+        }
+        pthread_attr_destroy(&attr);
+    }
+
+    close(listen_fd);
+    X509_free(ca_cert);
+    EVP_PKEY_free(ca_key);
+    return 0;
+}
+
+/* Load CA certificate and key */
+int load_ca_cert_and_key(const char *cert_path, const char *key_path) {
+    FILE *fp = fopen(cert_path, "r");
+    if (!fp) {
+        perror("fopen ca_cert");
+        return -1;
+    }
+    ca_cert = PEM_read_X509(fp, NULL, NULL, NULL);
+    fclose(fp);
+    if (!ca_cert) {
+        fprintf(stderr, "Failed to read CA certificate\n");
+        return -1;
+    }
+
+    fp = fopen(key_path, "r");
+    if (!fp) {
+        perror("fopen ca_key");
+        X509_free(ca_cert);
+        ca_cert = NULL;
+        return -1;
+    }
+    ca_key = PEM_read_PrivateKey(fp, NULL, NULL, NULL);
+    fclose(fp);
+    if (!ca_key) {
+        fprintf(stderr, "Failed to read CA key\n");
+        X509_free(ca_cert);
+        ca_cert = NULL;
+        return -1;
+    }
+
+    return 0;
+}
+
+/* Handle client connection */
+void *handle_client(void *arg) {
+    client_context_t *ctx = (client_context_t *)arg;
+    int client_fd = ctx->client_fd;
+    free(ctx);
+
+    /* Set socket timeout */
+    struct timeval tv;
+    tv.tv_sec = 30;
+    tv.tv_usec = 0;
+    setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+    char request[MAX_HEADER_SIZE];
+    ssize_t bytes_read = recv(client_fd, request, sizeof(request) - 1, 0);
+
+    if (bytes_read <= 0) {
+        close(client_fd);
+        return NULL;
+    }
+
+    request[bytes_read] = '\0';
+
+    /* Check if it's a CONNECT request (HTTPS) */
+    if (strncmp(request, "CONNECT ", 8) == 0) {
+        handle_https_connect(client_fd, request, bytes_read);
+    } else if (strncmp(request, "GET ", 4) == 0 || 
+               strncmp(request, "POST ", 5) == 0 ||
+               strncmp(request, "HEAD ", 5) == 0) {
+        handle_http_request(client_fd, request, bytes_read);
+    } else {
+        /* Unknown method */
+        const char *err = "HTTP/1.1 501 Not Implemented\r\n\r\n";
+        send(client_fd, err, strlen(err), 0);
+    }
+
+    close(client_fd);
+    return NULL;
+}
+
+/* Handle HTTP request */
+void handle_http_request(int client_fd, char *request, size_t req_len) {
+    char method[16], url[2048], version[16];
+    char hostname[256] = {0};
+    int port = 80;
+    char *host_line = NULL;
+
+    /* Parse request line */
+    if (sscanf(request, "%15s %2047s %15s", method, url, version) != 3) {
+        const char *err = "HTTP/1.1 400 Bad Request\r\n\r\n";
+        send(client_fd, err, strlen(err), 0);
+        return;
+    }
+
+    /* Extract hostname from Host header */
+    host_line = strstr(request, "Host: ");
+    if (host_line) {
+        host_line += 6;
+        char *end = strstr(host_line, "\r\n");
+        if (end) {
+            size_t len = end - host_line;
+            if (len < sizeof(hostname)) {
+                strncpy(hostname, host_line, len);
+                hostname[len] = '\0';
+                parse_host_port(hostname, NULL, &port);
             }
         }
-        
-        struct timeval tv = {1, 0};
-        int activity = select(max_fd + 1, &read_fds, NULL, NULL, &tv);
-        
-        if (activity < 0 && errno != EINTR) {
-            perror("Select error");
+    }
+
+    if (hostname[0] == '\0') {
+        const char *err = "HTTP/1.1 400 Bad Request\r\n\r\n";
+        send(client_fd, err, strlen(err), 0);
+        return;
+    }
+
+    /* Connect to server */
+    int server_fd = connect_to_server(hostname, port);
+    if (server_fd < 0) {
+        const char *err = "HTTP/1.1 502 Bad Gateway\r\n\r\n";
+        send(client_fd, err, strlen(err), 0);
+        return;
+    }
+
+    /* Forward request to server */
+    ssize_t sent = 0;
+    while (sent < (ssize_t)req_len) {
+        ssize_t n = send(server_fd, request + sent, req_len - sent, 0);
+        if (n < 0) {
+            close(server_fd);
+            return;
+        }
+        sent += n;
+    }
+
+    /* Receive response and inject header */
+    char response[BUFFER_SIZE];
+    ssize_t total_bytes = 0;
+    int first_chunk = 1;
+    
+    while (1) {
+        ssize_t bytes = recv(server_fd, response, sizeof(response), 0);
+        if (bytes <= 0) {
             break;
         }
         
-        // New connection?
-        if (FD_ISSET(proxy_listen_fd, &read_fds)) {
-            int new_socket = accept(proxy_listen_fd, NULL, NULL);
-            if (new_socket > 0) {
-                add_new_connection(new_socket);
-            }
+        size_t response_len = bytes;
+        
+        /* Inject header in first chunk if it's HTTP response */
+        if (first_chunk && bytes >= 5 && strncmp(response, "HTTP/", 5) == 0) {
+            inject_header(response, &response_len, sizeof(response));
+            first_chunk = 0;
         }
         
-        // Handle existing connections
-        for (int i = 0; i < MAX_CLIENTS; i++) {
-            if (connections[i].slot == 0) continue;
-            
-            if (connections[i].client_fd >= 0 && FD_ISSET(connections[i].client_fd, &read_fds)) {
-                if (connections[i].server_fd < 0) {
-                    // First request - need to parse and setup
-                    int bytes = read(connections[i].client_fd, connections[i].client_buffer, 
-                                   sizeof(connections[i].client_buffer) - 1);
-                    
-                    if (bytes <= 0) {
-                        close_connection(i);
-                        continue;
-                    }
-                    
-                    connections[i].client_buffer[bytes] = '\0';
-                    connections[i].client_buffer_len = bytes;
-                    
-                    char method[16], host[256], path[512];
-                    int port;
-                    
-                    if (parse_http_request(connections[i].client_buffer, method, host, &port, path) < 0) {
-                        fprintf(stderr, "Invalid HTTP request\n");
-                        close_connection(i);
-                        continue;
-                    }
-                    
-                    if (strcmp(method, "CONNECT") == 0) {
-                        // HTTPS - need SSL setup
-                        if (handle_connect_request(i, host, port) < 0) {
-                            close_connection(i);
+        /* Send to client */
+        ssize_t sent_to_client = 0;
+        while (sent_to_client < (ssize_t)response_len) {
+            ssize_t n = send(client_fd, response + sent_to_client, 
+                           response_len - sent_to_client, 0);
+            if (n < 0) {
+                close(server_fd);
+                return;
+            }
+            sent_to_client += n;
+        }
+        
+        total_bytes += bytes;
+    }
+
+    close(server_fd);
+}
+
+/* Handle HTTPS CONNECT request */
+void handle_https_connect(int client_fd, char *request, size_t req_len) {
+    char hostname[256], port_str[16];
+    int port = 443;
+
+    /* Parse CONNECT request: CONNECT hostname:port HTTP/1.1 */
+    char *space = strchr(request + 8, ' ');
+    if (!space) {
+        const char *err = "HTTP/1.1 400 Bad Request\r\n\r\n";
+        send(client_fd, err, strlen(err), 0);
+        return;
+    }
+
+    size_t host_len = space - (request + 8);
+    if (host_len >= sizeof(hostname)) {
+        const char *err = "HTTP/1.1 400 Bad Request\r\n\r\n";
+        send(client_fd, err, strlen(err), 0);
+        return;
+    }
+
+    strncpy(hostname, request + 8, host_len);
+    hostname[host_len] = '\0';
+
+    /* Parse hostname and port */
+    char *colon = strchr(hostname, ':');
+    if (colon) {
+        *colon = '\0';
+        port = atoi(colon + 1);
+    }
+
+    /* Connect to upstream server */
+    int server_fd = connect_to_server(hostname, port);
+    if (server_fd < 0) {
+        const char *err = "HTTP/1.1 502 Bad Gateway\r\n\r\n";
+        send(client_fd, err, strlen(err), 0);
+        return;
+    }
+
+    /* Create SSL connection to upstream server */
+    SSL_CTX *server_ctx = create_ssl_context_client();
+    if (!server_ctx) {
+        fprintf(stderr, "Failed to create server SSL context\n");
+        close(server_fd);
+        const char *err = "HTTP/1.1 502 Bad Gateway\r\n\r\n";
+        send(client_fd, err, strlen(err), 0);
+        return;
+    }
+
+    SSL *server_ssl = SSL_new(server_ctx);
+    if (!server_ssl) {
+        fprintf(stderr, "Failed to create server SSL object\n");
+        SSL_CTX_free(server_ctx);
+        close(server_fd);
+        const char *err = "HTTP/1.1 502 Bad Gateway\r\n\r\n";
+        send(client_fd, err, strlen(err), 0);
+        return;
+    }
+
+    SSL_set_fd(server_ssl, server_fd);
+    SSL_set_tlsext_host_name(server_ssl, hostname);
+
+    /* Try SSL connection with timeout */
+    int ssl_ret = SSL_connect(server_ssl);
+    if (ssl_ret <= 0) {
+        /* Connection to upstream server failed - silently handle it */
+        SSL_free(server_ssl);
+        SSL_CTX_free(server_ctx);
+        close(server_fd);
+        const char *err = "HTTP/1.1 502 Bad Gateway\r\n\r\n";
+        send(client_fd, err, strlen(err), 0);
+        return;
+    }
+
+    /* Send 200 Connection Established to client */
+    const char *response = "HTTP/1.1 200 Connection Established\r\n\r\n";
+    send(client_fd, response, strlen(response), 0);
+
+    /* Create SSL context for client connection with generated cert */
+    SSL_CTX *client_ctx = create_ssl_context_server();
+    if (!client_ctx) {
+        SSL_shutdown(server_ssl);
+        SSL_free(server_ssl);
+        SSL_CTX_free(server_ctx);
+        close(server_fd);
+        return;
+    }
+
+    /* Generate certificate for this hostname */
+    X509 *cert = generate_cert(hostname);
+    if (!cert) {
+        SSL_CTX_free(client_ctx);
+        SSL_shutdown(server_ssl);
+        SSL_free(server_ssl);
+        SSL_CTX_free(server_ctx);
+        close(server_fd);
+        return;
+    }
+
+    /* Set certificate and key in client SSL context */
+    SSL_CTX_use_certificate(client_ctx, cert);
+    SSL_CTX_use_PrivateKey(client_ctx, ca_key);
+
+    /* Create SSL connection to client */
+    SSL *client_ssl = SSL_new(client_ctx);
+    if (!client_ssl) {
+        fprintf(stderr, "Failed to create client SSL object\n");
+        SSL_CTX_free(client_ctx);
+        X509_free(cert);
+        SSL_shutdown(server_ssl);
+        SSL_free(server_ssl);
+        SSL_CTX_free(server_ctx);
+        close(server_fd);
+        return;
+    }
+
+    SSL_set_fd(client_ssl, client_fd);
+
+    /* Accept SSL connection from client */
+    int accept_ret = SSL_accept(client_ssl);
+    if (accept_ret <= 0) {
+        /* Connection failed - usually normal browser behavior (EOF during handshake)
+         * Don't log these errors as they clutter the output and are expected */
+        SSL_free(client_ssl);
+        SSL_CTX_free(client_ctx);
+        X509_free(cert);
+        SSL_shutdown(server_ssl);
+        SSL_free(server_ssl);
+        SSL_CTX_free(server_ctx);
+        close(server_fd);
+        return;
+    }
+
+    /* Now we have encrypted connections to both client and server */
+    /* Relay data between them with header injection */
+    
+    fd_set readfds;
+    int max_fd = (client_fd > server_fd) ? client_fd : server_fd;
+    char client_buffer[BUFFER_SIZE];
+    char server_buffer[BUFFER_SIZE];
+    int active = 1;
+    int first_response = 1;
+
+    /* Set non-blocking mode for better performance */
+    int flags = fcntl(client_fd, F_GETFL, 0);
+    fcntl(client_fd, F_SETFL, flags | O_NONBLOCK);
+    flags = fcntl(server_fd, F_GETFL, 0);
+    fcntl(server_fd, F_SETFL, flags | O_NONBLOCK);
+
+    while (active) {
+        FD_ZERO(&readfds);
+        FD_SET(client_fd, &readfds);
+        FD_SET(server_fd, &readfds);
+
+        struct timeval timeout;
+        timeout.tv_sec = 60;
+        timeout.tv_usec = 0;
+
+        int ret = select(max_fd + 1, &readfds, NULL, NULL, &timeout);
+        if (ret < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        if (ret == 0) {
+            break; /* Timeout */
+        }
+
+        /* Data from client to server */
+        if (FD_ISSET(client_fd, &readfds)) {
+            int bytes = SSL_read(client_ssl, client_buffer, sizeof(client_buffer));
+            if (bytes <= 0) {
+                int err = SSL_get_error(client_ssl, bytes);
+                if (err != SSL_ERROR_WANT_READ && err != SSL_ERROR_WANT_WRITE) {
+                    break;
+                }
+            } else {
+                int sent = 0;
+                while (sent < bytes) {
+                    int n = SSL_write(server_ssl, client_buffer + sent, bytes - sent);
+                    if (n <= 0) {
+                        int err = SSL_get_error(server_ssl, n);
+                        if (err != SSL_ERROR_WANT_READ && err != SSL_ERROR_WANT_WRITE) {
+                            active = 0;
+                            break;
                         }
                     } else {
-                        // Regular HTTP
-                        if (handle_http_request(i) < 0) {
-                            close_connection(i);
-                        }
+                        sent += n;
                     }
-                } else {
-                    handle_data_transfer(i, 1);
                 }
             }
-            
-            if (connections[i].server_fd >= 0 && FD_ISSET(connections[i].server_fd, &read_fds)) {
-                handle_data_transfer(i, 0);
+        }
+
+        /* Data from server to client (inject header here) */
+        if (FD_ISSET(server_fd, &readfds) && active) {
+            int bytes = SSL_read(server_ssl, server_buffer, sizeof(server_buffer));
+            if (bytes <= 0) {
+                int err = SSL_get_error(server_ssl, bytes);
+                if (err != SSL_ERROR_WANT_READ && err != SSL_ERROR_WANT_WRITE) {
+                    break;
+                }
+            } else {
+                /* Try to inject header if this looks like HTTP response */
+                size_t len = bytes;
+                if (first_response && bytes >= 5 && strncmp(server_buffer, "HTTP/", 5) == 0) {
+                    inject_header(server_buffer, &len, sizeof(server_buffer));
+                    first_response = 0;
+                }
+                
+                int sent = 0;
+                while (sent < (int)len) {
+                    int n = SSL_write(client_ssl, server_buffer + sent, len - sent);
+                    if (n <= 0) {
+                        int err = SSL_get_error(client_ssl, n);
+                        if (err != SSL_ERROR_WANT_READ && err != SSL_ERROR_WANT_WRITE) {
+                            active = 0;
+                            break;
+                        }
+                    } else {
+                        sent += n;
+                    }
+                }
             }
         }
     }
+
+    /* Cleanup */
+    SSL_shutdown(client_ssl);
+    SSL_free(client_ssl);
+    SSL_CTX_free(client_ctx);
+    X509_free(cert);
+    SSL_shutdown(server_ssl);
+    SSL_free(server_ssl);
+    SSL_CTX_free(server_ctx);
+    close(server_fd);
+}
+
+/* Connect to upstream server */
+int connect_to_server(const char *hostname, int port) {
+    struct hostent *host = gethostbyname(hostname);
+    if (!host) {
+        return -1;
+    }
+
+    int sockfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (sockfd < 0) {
+        return -1;
+    }
+
+    /* Set socket timeout */
+    struct timeval timeout;
+    timeout.tv_sec = 10;
+    timeout.tv_usec = 0;
+    setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    setsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+
+    struct sockaddr_in server_addr;
+    memset(&server_addr, 0, sizeof(server_addr));
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(port);
+    memcpy(&server_addr.sin_addr, host->h_addr_list[0], host->h_length);
+
+    if (connect(sockfd, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
+        close(sockfd);
+        return -1;
+    }
+
+    return sockfd;
+}
+
+/* Create SSL context for server (proxy as server to client) */
+SSL_CTX *create_ssl_context_server(void) {
+    SSL_CTX *ctx = SSL_CTX_new(TLS_server_method());
+    if (!ctx) {
+        return NULL;
+    }
+    SSL_CTX_set_options(ctx, SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3);
+    return ctx;
+}
+
+/* Create SSL context for client (proxy as client to server) */
+SSL_CTX *create_ssl_context_client(void) {
+    SSL_CTX *ctx = SSL_CTX_new(TLS_client_method());
+    if (!ctx) {
+        return NULL;
+    }
+    SSL_CTX_set_options(ctx, SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3);
+    SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
+    return ctx;
+}
+
+/* Generate certificate for hostname signed by CA */
+X509 *generate_cert(const char *hostname) {
+    X509 *cert = X509_new();
+    if (!cert) {
+        fprintf(stderr, "Failed to create X509 certificate\n");
+        return NULL;
+    }
+
+    /* Set version (X509 v3) */
+    if (!X509_set_version(cert, 2)) {
+        fprintf(stderr, "Failed to set certificate version\n");
+        X509_free(cert);
+        return NULL;
+    }
+
+    /* Set serial number - use random value based on time and hostname */
+    unsigned long serial = (unsigned long)time(NULL);
+    for (size_t i = 0; hostname[i] != '\0'; i++) {
+        serial = serial * 31 + hostname[i];
+    }
+    ASN1_INTEGER_set(X509_get_serialNumber(cert), serial);
+
+    /* Set validity period - start 1 day in past to handle clock skew */
+    X509_gmtime_adj(X509_get_notBefore(cert), -86400L);  /* -1 day */
+    X509_gmtime_adj(X509_get_notAfter(cert), 31536000L); /* +1 year */
+
+    /* Set subject */
+    X509_NAME *name = X509_get_subject_name(cert);
+    X509_NAME_add_entry_by_txt(name, "C", MBSTRING_ASC, 
+                               (unsigned char *)"US", -1, -1, 0);
+    X509_NAME_add_entry_by_txt(name, "O", MBSTRING_ASC, 
+                               (unsigned char *)"CS112 Proxy", -1, -1, 0);
+    X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC, 
+                               (unsigned char *)hostname, -1, -1, 0);
+
+    /* Set issuer (CA) */
+    X509_set_issuer_name(cert, X509_get_subject_name(ca_cert));
+
+    /* Set public key */
+    if (!X509_set_pubkey(cert, ca_key)) {
+        fprintf(stderr, "Failed to set public key\n");
+        X509_free(cert);
+        return NULL;
+    }
+
+    /* Setup extension context */
+    X509V3_CTX ctx;
+    X509V3_set_ctx_nodb(&ctx);
+    X509V3_set_ctx(&ctx, ca_cert, cert, NULL, NULL, 0);
     
-    close(proxy_listen_fd);
-    
-    if (g_ca_cert) X509_free(g_ca_cert);
-    if (g_ca_key) EVP_PKEY_free(g_ca_key);
-    
-    return 0;
+    /* Add Basic Constraints extension */
+    X509_EXTENSION *ext = X509V3_EXT_conf_nid(NULL, &ctx, 
+                                              NID_basic_constraints, 
+                                              "CA:FALSE");
+    if (ext) {
+        X509_add_ext(cert, ext, -1);
+        X509_EXTENSION_free(ext);
+    }
+
+    /* Add Key Usage extension */
+    ext = X509V3_EXT_conf_nid(NULL, &ctx, NID_key_usage, 
+                              "digitalSignature,keyEncipherment");
+    if (ext) {
+        X509_add_ext(cert, ext, -1);
+        X509_EXTENSION_free(ext);
+    }
+
+    /* Add Extended Key Usage extension for TLS Web Server Authentication */
+    ext = X509V3_EXT_conf_nid(NULL, &ctx, NID_ext_key_usage, 
+                              "serverAuth");
+    if (ext) {
+        X509_add_ext(cert, ext, -1);
+        X509_EXTENSION_free(ext);
+    }
+
+    /* Add Subject Alternative Name (SAN) extension - CRITICAL for modern browsers */
+    char san[512];
+    snprintf(san, sizeof(san), "DNS:%s", hostname);
+    ext = X509V3_EXT_conf_nid(NULL, &ctx, NID_subject_alt_name, san);
+    if (ext) {
+        X509_add_ext(cert, ext, -1);
+        X509_EXTENSION_free(ext);
+    } else {
+        fprintf(stderr, "Warning: Failed to add SAN extension for %s\n", hostname);
+    }
+
+    /* Sign certificate with CA key */
+    if (!X509_sign(cert, ca_key, EVP_sha256())) {
+        fprintf(stderr, "Failed to sign certificate\n");
+        ERR_print_errors_fp(stderr);
+        X509_free(cert);
+        return NULL;
+    }
+
+    return cert;
+}
+
+/* Inject X-Proxy:CS112 header into HTTP response */
+void inject_header(char *response, size_t *response_len, size_t buffer_size) {
+    /* Find end of status line */
+    char *header_end = strstr(response, "\r\n");
+    if (!header_end) {
+        return;
+    }
+
+    /* Check if header already exists */
+    if (strstr(response, "X-Proxy:")) {
+        return;
+    }
+
+    /* Calculate new size */
+    const char *new_header = "X-Proxy:CS112\r\n";
+    size_t new_header_len = strlen(new_header);
+    size_t insert_pos = header_end + 2 - response;
+
+    if (*response_len + new_header_len >= buffer_size) {
+        return; /* Not enough space */
+    }
+
+    /* Move data to make room */
+    memmove(response + insert_pos + new_header_len,
+            response + insert_pos,
+            *response_len - insert_pos);
+
+    /* Insert header */
+    memcpy(response + insert_pos, new_header, new_header_len);
+    *response_len += new_header_len;
+}
+
+/* Parse hostname and port from Host header */
+void parse_host_port(char *host_header, char **hostname, int *port) {
+    char *colon = strchr(host_header, ':');
+    if (colon) {
+        *colon = '\0';
+        *port = atoi(colon + 1);
+    }
 }
 

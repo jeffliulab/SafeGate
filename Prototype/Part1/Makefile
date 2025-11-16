@@ -18,8 +18,8 @@ CFLAGS = -Dfread=BANNED_fread \
          -Dfgets=BANNED_fgets \
          -Dfputs=BANNED_fputs
 
-# OpenSSL related
-LDFLAGS = -lssl -lcrypto -lnsl
+# OpenSSL related and pthread for multi-threading
+LDFLAGS = -lssl -lcrypto -lpthread -lnsl
 
 proxy: $(obj)
 	$(CC) -o $@ $^ $(LDFLAGS)
